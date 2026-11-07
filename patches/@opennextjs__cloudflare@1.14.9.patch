@@ -1,0 +1,99 @@
+diff --git a/dist/cli/build/bundle-server.js b/dist/cli/build/bundle-server.js
+index 88f4eec4fedfa35124fca1eef49db04a21a64b90..d6b2f25d9fe58e35b90b652a5c69c1041e821253 100644
+--- a/dist/cli/build/bundle-server.js
++++ b/dist/cli/build/bundle-server.js
+@@ -36,6 +36,10 @@ const optionalDependencies = [
+     "probe-image-size",
+     // `server.edge` is not available in react-dom@18
+     "react-dom/server.edge",
++    // sharp ships native .node binaries with wildcard requires that esbuild
++    // cannot resolve. This app sets images.unoptimized so image optimization
++    // never runs, and the lazy require('sharp') stays a throwing shim.
++    "sharp",
+ ];
+ /**
+  * Bundle the Open Next server.
+diff --git a/dist/cli/build/patches/plugins/next-server.js b/dist/cli/build/patches/plugins/next-server.js
+index c2b85c3c551ace836a1ac4c5dba6782c4f41205a..1511272e11d9ea62f9730f02c846adcfb95b1665 100644
+--- a/dist/cli/build/patches/plugins/next-server.js
++++ b/dist/cli/build/patches/plugins/next-server.js
+@@ -29,6 +29,16 @@ export function patchNextServer(updater, buildOpts) {
+                 // Node middleware are not supported on Cloudflare yet
+                 contents = patchCode(contents, disableNodeMiddlewareRule);
+                 contents = patchCode(contents, attachRequestMetaRule);
++                // `getMiddlewareManifest` relies on a dynamic require that workerd
++                // rejects. Middleware is served from its own edge handler, so the
++                // Node server must never load the manifest.
++                // On Windows, pnpm uses absolute symlinks, so esbuild resolves
++                // `next/dist/server/next-server.js` to the project's node_modules
++                // copy instead of the patched traced file under `.open-next`.
++                // These rules are therefore applied here, on the content that
++                // actually gets bundled.
++                contents = patchCode(contents, removeMiddlewareManifestRule);
++                contents = patchCode(contents, disablePreloadingRule);
+                 return contents;
+             },
+         },
+@@ -45,6 +55,38 @@ fix: |-
+     // patched by open next
+   }
+ `;
++// Disable the background preloading of routes done by NextServer by default during the creation of NextServer
++export const disablePreloadingRule = `
++rule:
++  kind: statement_block
++  inside:
++    kind: if_statement
++    any:
++      - has:
++          kind: member_expression
++          pattern: this.nextConfig.experimental.preloadEntriesOnStart
++          stopBy: end
++      - has:
++          kind: binary_expression
++          pattern: appDocumentPreloading === true
++          stopBy: end
++fix:
++  '{}'
++`;
++// `getMiddlewareManifest` performs a dynamic require of the middleware manifest
++// that workerd rejects. Middleware is handled by its own edge handler, so the
++// Node server must never load the manifest.
++export const removeMiddlewareManifestRule = `
++rule:
++  kind: statement_block
++  inside:
++    kind: method_definition
++    has:
++      kind: property_identifier
++      regex: ^getMiddlewareManifest$
++fix:
++  '{return null;}'
++`;
+ export const buildIdRule = `
+ rule:
+   pattern:
+diff --git a/dist/cli/build/patches/plugins/optional-deps.js b/dist/cli/build/patches/plugins/optional-deps.js
+index f5001475b78a258860ab4c2256dd8df58e6f3198..d4f962479756a9d9fceb1d9e82a9339cd3b19098 100644
+--- a/dist/cli/build/patches/plugins/optional-deps.js
++++ b/dist/cli/build/patches/plugins/optional-deps.js
+@@ -25,6 +25,19 @@ export function handleOptionalDependencies(dependencies) {
+                 if (pluginData === marker) {
+                     return {};
+                 }
++                // sharp ships prebuilt native `.node` binaries with wildcard
++                // requires that esbuild cannot resolve, so it can never be
++                // inlined. This app disables image optimization
++                // (images.unoptimized), so its lazy require stays a throwing
++                // shim even when sharp happens to be installed transitively
++                // (e.g. via miniflare).
++                if (path === "sharp" || path.startsWith("sharp/")) {
++                    return {
++                        path: `/${path}`,
++                        namespace: nsMissingDependency,
++                        pluginData: { name: path },
++                    };
++                }
+                 const result = await build.resolve(path, {
+                     ...options,
+                     pluginData: marker,
